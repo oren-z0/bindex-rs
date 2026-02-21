@@ -31,6 +31,9 @@ pub enum Error {
 
     #[error("block not found: {0}")]
     BlockNotFound(#[from] headers::Reorg),
+
+    #[error("IO failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug)]
@@ -57,21 +60,41 @@ pub struct IndexedChain {
     headers: headers::Headers,
     client: client::Client,
     store: db::DB,
+    cdb_path: Option<PathBuf>,
+    cdb_max_txnum: Option<index::TxNum>,
 }
 
 #[derive(Debug)]
 pub struct Config {
     db_path: PathBuf,
     url: String,
+    cdb_dir: Option<PathBuf>,
+    cdb_max_txnum: Option<u32>,
 }
 
 impl IndexedChain {
     /// Open an existing DB, or create if missing.
     /// Use binary format REST API for fetching the data from bitcoind.
     pub fn open(db_dir: impl AsRef<Path>, network: Network) -> Result<Self, Error> {
+        Self::open_with_options(db_dir, network, None, None)
+    }
+
+    /// Open with optional CDB directory and max txnum for CDB storage.
+    pub fn open_with_options(
+        db_dir: impl AsRef<Path>,
+        network: Network,
+        cdb_dir: Option<impl AsRef<Path>>,
+        cdb_max_txnum: Option<u32>,
+    ) -> Result<Self, Error> {
         let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
         let url = format!("http://localhost:{}", default_rpc_port(network));
-        Self::from_config(Config { db_path, url })
+        let cdb_dir = cdb_dir.map(|d| d.as_ref().to_path_buf());
+        Self::from_config(Config {
+            db_path,
+            url,
+            cdb_dir,
+            cdb_max_txnum,
+        })
     }
 
     fn from_config(config: Config) -> Result<Self, Error> {
@@ -104,6 +127,14 @@ impl IndexedChain {
             res => assert_eq!(index::BlockBytes::new(res?), genesis_block),
         };
 
+        let cdb_path = config.cdb_dir.as_ref().map(|cdb_dir| {
+            cdb_dir.join(config.db_path.file_name().expect("db_path has filename"))
+        });
+        if let Some(ref path) = cdb_path {
+            std::fs::create_dir_all(path)?;
+        }
+        let cdb_max_txnum = config.cdb_max_txnum.map(index::TxNum);
+
         let store = db::DB::open(config.db_path)?;
         let headers = headers::Headers::new(store.headers()?);
         if let Some(indexed_genesis) = headers.genesis() {
@@ -121,6 +152,8 @@ impl IndexedChain {
             headers,
             client,
             store,
+            cdb_path,
+            cdb_max_txnum,
         })
     }
 
@@ -299,6 +332,8 @@ mod tests {
         let config = Config {
             db_path: dir.path().to_path_buf(),
             url: format!("http://{}", node.params.rpc_socket),
+            cdb_dir: None,
+            cdb_max_txnum: None,
         };
         let mut chain = IndexedChain::from_config(config).unwrap();
         let stats = chain.sync(1000).unwrap();
